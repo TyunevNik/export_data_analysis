@@ -1,0 +1,312 @@
+---
+title: "Export data analysis"
+author: "Nikita Tyunev"
+date: "09.12.2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+#Библиотеки подключаем
+library(openxlsx)
+library(data.table)
+library(plotly)
+```
+
+## 0. Первичный сбор данных
+
+Считываем и собираем данные для дальнейшего анализа. Записываем сырую версию данных - в том виде, в котором их прислали, без правок.
+
+```{r data_import, warning=FALSE}
+# Найдём все листы в файле
+sheets <- getSheetNames(list.files(pattern = '\\.xlsx$', full.names = TRUE))
+
+# Создадим пустые листы и вектор для сортировки экселевских листов
+stores_data <- list()
+sales_data <- list()
+empty_pages <- character()
+
+# Прочитаем и рассортируем листы на пустые, stores и sales 
+# При наличии непустых несортированных выдаст ошибку
+# К непустым строкам добавляется столбец с названием листа
+for (sheet_name in sheets) {
+  sheet_data <- read.xlsx(list.files(pattern = '\\.xlsx$', full.names = TRUE), sheet = sheet_name)
+  if (length(sheet_data) > 0) {
+    setDT(sheet_data)
+    sheet_data$sheet_name <- sheet_name
+    if (grepl('Sales', sheet_name)) {
+      sales_data <- append(sales_data, list(sheet_data))
+    } else if (grepl('Stores', sheet_name)) {
+      stores_data <- append(stores_data, list(sheet_data))
+    } else {stop('Uncategorized non-empty pages')}    
+  } else {empty_pages <- append(empty_pages, sheet_name)}
+}
+
+# Собираем всё в таблицы
+sales_data <- rbindlist(sales_data)
+stores_data <- rbindlist(stores_data)
+
+# Пишем данные в сыром виде (не забыв убрать добавленный столбец перед записью)
+write.table(sales_data[, -4], './sales_data_raw.txt')
+write.table(stores_data[, -10], './stores_data_raw.txt')
+
+```
+
+P.S. Stores собирается собирается с одного листа, так что столбец с названием родительского листа для неё явно излишний
+```{r}
+stores_data <- stores_data[, -10]
+```
+
+
+
+## 1. Заголовки на листе Stores
+
+Заголовки содержат объеденённые ячейки. На мой взгляд это уже вполне достойно считаться ошибкой и проблемой в данных. Но это вполне поправимо нашими силами.
+
+```{r unioned cells}
+# Зададим свои названия столбцов, чтобы было проще работать с данными (заодно и для sales)
+names(stores_data) <- c('store_id', 'BLK', 'KDC_old', 'city', 'region', 'latitude', 'longitude', 'opened', 'closed')
+names(sales_data) <- c('store_id', 'week', 'volume', 'sheet_name')
+
+# И выкинем первую строку из stores, так как она содержит части заголовков, а не данные
+stores_data <- stores_data[-1,]
+```
+
+## 2. Формат store_id в stores
+
+Заметим, что store_id в sales представлены единым форматом int, тогда как в stores есть помимо этого формата другой - 'N'+'int'. Приведём Id к в stores к единому виду и отформатируем как int:
+
+```{r paged.print=TRUE}
+stores_data$store_id <- as.integer(gsub('[^0-9]', '', stores_data$store_id))
+
+```
+
+## 3. Поехавшие столбцы в stores
+
+В stores данные съехали на столбец. Это хорошо видно по столбцу KDC_old:
+
+```{r paged.print=TRUE}
+print(stores_data[, KDC_old])
+```
+
+Отсеем по этому столбцу поехавшие строки и починим таблицу
+
+```{r paged.print=TRUE}
+#Сначала схороним результаты проверки на съехавшесть, это потом ещё пригодится
+stores_data_moved <- stores_data$KDC_old != '-'
+stores_data_list <- list()
+# Соберём новую stores_data из несъехавшей части, у которой выкинем KDC_old. В оригинальном названии было не использовать, так что у нас развязаны руки
+stores_data_list <- append(stores_data_list, list(stores_data[KDC_old == '-', .SD, .SDcols = !'KDC_old']))
+# И съехавшей части, у которой выкинем последний столбец, который всё равно должен быть пустым
+stores_data_list <- append(stores_data_list, list(stores_data[KDC_old != '-', .SD, .SDcols = !'closed']))
+stores_data <- rbindlist(stores_data_list, use.names = FALSE)
+
+```
+
+
+## 4. Лишние столбцы в Stores
+
+Помимо вышеупомянутого столбца KDC_old, в названии которого содержится явное указание на его ненужность (кроме того, по всем несъехавшим строкам у него одинаковое значение), в stores есть столбец BLK, в котором содержится одно значение для всех строк. Очевидно, такая информация в таблице бесполезна
+
+```{r paged.print=TRUE}
+# Выкинем лишний столбец
+stores_data$BLK <- NULL
+```
+
+## 4.a Лишние пустые листы
+
+В целом не мешают, но являют собой явно лишнюю сущность пустые листы
+```{r paged.print=TRUE}
+empty_pages
+```
+
+
+## 5. Неверно указанные координаты
+
+Проверим координаты на соответствие друг другу по городам
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+# Отформатируем их как числа для удобства:
+stores_data$longitude <- as.numeric(stores_data$longitude)
+stores_data$latitude <- as.numeric(stores_data$latitude)
+# Посмотрим стандартное отклонение в координатах точек для каждого города. По идее значения не должны быть очень большими
+# Длина окружности Земли около 40000, т.е. на 1 градус приходится больше 100 километров. 
+# Думаю будет логично считать стандартное отклонение больше 1 градуса в таком случае крайне подозрительным
+# Также обратим внимание на максимальную долготу - она не может быть больше 90 градусов
+stores_data[, .(latitude_dev = sd(latitude), longitude_dev = sd(longitude), longitude_max = max(longitude)), by = 'city']
+# Построим координаты на графике для удобства
+plot_ly(data = stores_data, x = ~longitude, y = ~latitude, type = 'scatter', color = ~city)
+```
+
+
+Здесь, если посмотреть посмотреть по отдельным городам, станет ясно, что в некоторых случаях широта и долгота перепутаны местами.
+Попробуем локализовать проблему
+
+```{r}
+# Посмотрим отдельно строки, которые были смещены
+stores_data[stores_data_moved, .(latitude_dev = sd(latitude), longitude_dev = sd(longitude), longitude_max = max(longitude)), by = 'city']
+# И которые не были
+stores_data[!stores_data_moved, .(latitude_dev = sd(latitude), longitude_dev = sd(longitude), longitude_max = max(longitude)), by = 'city']
+
+```
+
+Судя по резко уменьшившимся отклонениям, координаты были сбиты именно по этому принципу. Если посмотреть на долготу Иркутска и Хабаровска, то можно понять, что неверно они указаны именно в поехавших строках. Починим проблему:
+
+```{r message=FALSE, warning=FALSE}
+# Поменяем координаты местами в проблемных строках
+stores_moved_coordinates <- stores_data[stores_data_moved, .(latitude, longitude)]
+stores_data[stores_data_moved, latitude := stores_moved_coordinates$longitude]
+stores_data[stores_data_moved, longitude := stores_moved_coordinates$latitude]
+
+# И ещё раз посмотрим отклонения и график
+stores_data[, .(latitude_dev = sd(latitude), longitude_dev = sd(longitude), longitude_max = max(longitude)), by = 'city']
+plot_ly(data = stores_data, x = ~longitude, y = ~latitude, type = 'scatter', color = ~city)
+```
+Теперь все они находятся в рамках разумного.
+
+## 6. Распределение городов по регионам
+
+Посмотрим на распределение городов по регионам
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+unique(stores_data[, .(city, region)])
+```
+
+Можно заметить, что оно не соответствует ни областям, ни федеральным округам. Это какая-то своя логика, на которую поставщик в целом имеет право. 
+Вопросы вызывает только определение Оренбурга в Сибирь. Этот город является областным центром области относящейся к Приволжскому ФО. Кроме того, буквально через него протекает река Урал. И, если этого мало, то Уфа, которая находится восточнее, определена к Уралу. 
+Но можно предположить, что такое распределение - часть клиентского легаси. В любом случае считаю стоит обратить на это внимание.
+
+
+## 7. Не хватает данных по дате открытия
+
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+stores_data[is.na(stores_data$opened)]
+```
+
+Для магазина 269 нет даты открытия
+Заодно давайте конвертируем даты из чисел:
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+# Эксель отсчитывает от 1 января 1900
+stores_data$opened <- as.Date(as.integer(stores_data$opened), origin = '1900-01-01')
+stores_data$closed <- as.Date(as.integer(stores_data$closed), origin = '1900-01-01')
+# То же для недель sales:
+sales_data$week <- as.Date(as.integer(sales_data$week), origin = '1900-01-01')
+
+```
+
+Ну и заодно проверим, что в sales_data нет пустых значений где не надо:
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+sales_data[is.na(sales_data$store_id)]
+sales_data[is.na(sales_data$week)]
+sales_data[is.na(sales_data$volume)]
+
+```
+
+## 8. Дубликаты:
+
+Проверим на наличие полных дубликатов stores и sales
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+stores_data[, .N, by = names(stores_data)][N>1]
+sales_data[, .N, by = names(sales_data)][N>1]
+
+```
+
+В stores дублируется store_id 150
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+# Поправим это
+stores_data <- unique(stores_data)
+
+```
+
+Теперь проверим не по полным строкам, а по ключу, который должен быть уникальным:
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+stores_data[, .N, by = 'store_id'][N>1]
+sales_data[, .N, by = c('store_id', 'week')][N>1]
+```
+Посмотрим какие магазины задвоились и с каких листов они пришли в продажи:
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+stores_data[store_id %in% unique(sales_data[, .N, by = c('store_id', 'week')][N>1][, store_id])]
+unique(sales_data[store_id %in% unique(sales_data[, .N, by = c('store_id', 'week')][N>1][, store_id]), sheet_name])
+
+```
+Выходит, что магазины 14, 74, 97, 176, 182, 253, 261 попали в продажи и в Омске и в Томске. По данным из sales они находятся в Омске, поэтому информацию с листа Омска следует считать приоритетной.
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+sales_data <- sales_data[!(store_id %in% unique(sales_data[, .N, by = c('store_id', 'week')][N>1][, store_id]) & grepl('Томск', sheet_name))]
+```
+
+## 8.a Не хватает строки в stores 
+
+Для дальнейших проверок смёрджим таблицы stores и sales
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+merged_data <- merge.data.table(sales_data, stores_data, by = 'store_id', all = TRUE)
+# Найдём такие store_id, по которым были продажи, но их нет в stores
+unique(merged_data[is.na(city), .(store_id, sheet_name)])
+
+```
+Похоже, что не хватает данных по двум магазинам из Екатеринбурга: 42, 45
+
+## 9. Есть магазины, которые были открыты в искомый период в искомых регионах без продаж
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+# Найдём такие store_id, по которым были продажи, но их нет в stores
+merged_data[(!closed < as.Date('2018-01-01') | is.na(closed)) & region %in% c('Урал', 'Сибирь') & is.na(volume)]
+```
+Выходит, что по магазинам 105, 107, 191, 252, 259 из Иркутска не хватате данных по продажам
+
+
+## 10. Закрытые магазины с продажами
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+unique(merged_data[closed < as.Date('2018-01-01') & region %in% c('Урал', 'Сибирь') & !is.na(volume), .(store_id, sheet_name, city, region, latitude, longitude, opened, closed)])
+```
+В искомых регионах такой нашёлся один - в Челябинске
+
+## 11. Лишний регион
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+unique(merged_data[!region %in% c('Урал', 'Сибирь') & !is.na(volume) & !is.na(region), .(store_id, sheet_name, city, region, latitude, longitude, opened, closed)])
+```
+Прислали данные по 7 магазинам из Самары, хотя Самара вне интересующих нас регионов
+
+## 12. Полнота и последовательность данных по неделям: 
+
+В данных из этих магазинов пропущены/смещены периоды недель:
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+setorder(merged_data, store_id, week)
+merged_data[opened < as.Date('2018-01-01'), opened_mod := as.Date('2018-01-01')]
+merged_data[opened >= as.Date('2018-01-01'), opened_mod := opened]
+merged_data[is.na(closed), closed_mod := max(merged_data$week, na.rm = TRUE)]
+merged_data[!is.na(closed), closed_mod := closed]
+merged_data[, next_week := shift(week, type = 'lead'), by=store_id]
+merged_data[, week_diff := next_week-week]
+unique(merged_data[week_diff != 7, .(store_id, city, region, opened, closed)])
+```
+
+По следующим магазинам не хватает данных с начала или с конца периода наблюдения:
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+
+merged_data[, .(data_days_available = sum(week_diff, na.rm = TRUE)), by = .(store_id, city, closed_mod-opened_mod)][data_days_available > 0 & closed_mod - data_days_available > 7]
+
+```
+
+
+## 0.a Запишем исправленную версию данных: 
+
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+write.table(sales_data, './sales_data_patched.txt')
+write.table(stores_data, './stores_data_patched.txt')
+```
